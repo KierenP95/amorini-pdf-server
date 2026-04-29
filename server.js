@@ -38,7 +38,7 @@ app.post('/extract', async (req, res) => {
           const end = Math.min(start + CHUNK_SIZE, totalPages);
           const subDoc = await PDFDocument.create();
           const indices = Array.from({ length: end - start }, (_, i) => start + i);
-          const copiedPages = await subDoc.copyPagesFrom(pdfDoc, indices);
+          const copiedPages = await subDoc.copyPages(pdfDoc, indices);
           copiedPages.forEach(p => subDoc.addPage(p));
           const subBytes = await subDoc.save();
           chunks.push(Buffer.from(subBytes).toString('base64'));
@@ -52,7 +52,6 @@ app.post('/extract', async (req, res) => {
  
     console.log(`Processing ${chunks.length} chunk(s)`);
  
-    // Simple prompt — extract exactly what's on each label, no classification, no stripping
     const prompt = `This is a Katana production label PDF. Each page is one label with this structure:
  
 [barcode number]
@@ -129,7 +128,6 @@ SHIRT1050 1`;
           const code = parts[0].toUpperCase();
           const val = parseFloat(parts[1]);
  
-          // Basic sanity check — must be a plausible code and numeric value
           if (!code.match(/^[A-Z][A-Z0-9_-]+$/) || isNaN(val) || val <= 0) return;
  
           allCodes[code] = (allCodes[code] || 0) + val;
