@@ -6,7 +6,6 @@ const { PDFDocument } = require('pdf-lib');
 const app = express();
 const PORT = process.env.PORT || 3000;
  
-// Allow requests from your Netlify site
 app.use(cors({
   origin: ['https://amorinilogisticsinterstatebookings.netlify.app', 'http://localhost:3000']
 }));
@@ -24,7 +23,6 @@ app.post('/extract', async (req, res) => {
  
     const pdfBytes = Buffer.from(pdfBase64, 'base64');
  
-    // Split PDF into chunks of 40 pages
     const CHUNK_SIZE = 40;
     const chunks = [];
  
@@ -54,48 +52,32 @@ app.post('/extract', async (req, res) => {
  
     console.log(`Processing ${chunks.length} chunk(s)`);
  
-    const prompt = `Extract ALL product codes from this Katana label PDF. Process every single page.
+    // Simple prompt — extract exactly what's on each label, no classification, no stripping
+    const prompt = `This is a Katana production label PDF. Each page is one label with this structure:
  
-Each page has this structure:
 [barcode number]
 [date]
-[qty] pcs or [length] m
-[job ref] - [description]
+[quantity] pcs  OR  [length] m
+[job reference] - [room/description]
 [PRODUCT CODE]
 *scan*
  
-Extract the PRODUCT CODE and quantity/length from every page.
+Extract the PRODUCT CODE and its quantity/length from every page.
  
-Rules by product type:
+Rules:
+- Output the product code EXACTLY as printed — do not strip or modify any prefix
+- If the label shows "pcs", output the integer quantity
+- If the label shows "m", output the decimal length (e.g. 3.405)
+- One line per page: CODE VALUE
+- Skip blank pages and the final "Powered by PDF Generator API" page
+- No headings, no explanations, just the list
  
-CABINETS (prefix PMW-, OLOA-, PJMW-, ESC-, EMW-, OCO-, ESO-, ESS-, OAO-, OCW-, OHO-, ONB-, OSPO-, OMW-, SMC-, SMN-, SMS-, PGW-, PSN-, SDA- AND the part after the prefix looks like a cabinet code — letters followed by numbers, e.g. SB100, WBO900, B600):
-- Strip the prefix, output just the cabinet code + qty
-- Example: PMW-SB600 1 → SB600 1
- 
-DOORS & PANELS (prefix PMW-, PJMW- etc BUT the part after the prefix is NOT a cabinet code — it's an abbreviation like TFK, BEP, SFP, WEP, UP, BB, FP, F409, F40Z, F45D, F454 etc):
-- Keep the FULL code including prefix
-- Example: PMW-TFK 1 → PMW-TFK 1
-- Example: PJMW-F454 1 → PJMW-F454 1
- 
-BENCHTOPS linear metre (prefix BXP-, has metres on label):
-- Keep full code + length in metres
-- Example: BXPCEN-FIRESTN695 3.405 → BXPCEN-FIRESTN695 3.405
- 
-BENCHTOPS slab (format COLOUR-DIMENSIONS, has pcs):
-- Keep full code + qty
-- Example: ALPINE-3050900 2 → ALPINE-3050900 2
- 
-WARDROBE COMPONENTS (prefix T-, SHIRT, codes like SHIRT1050, T-DT60, T-CLEAT41795, T-SHELF1245, T-UPRIGHT1945):
-- Keep full code + qty
-- Example: SHIRT1050 3 → SHIRT1050 3
- 
-HARDWARE & OTHER (codes like IADJL, KTDRW45-SC, D500, DRILLINPUSHCATCH, BXPLAMVOLCBLK60):
-- Keep full code + qty
- 
-EXCLUDE entirely: DW605, FLUPANEL, Custom_* codes
- 
-Output one line per unique code: CODE VALUE
-No explanations. No headings. Just the list.`;
+Example output:
+PMW-TFK 1
+PMW-BEP 3
+BXPCEN-FIRESTN695 3.405
+SB600 2
+SHIRT1050 1`;
  
     const allCodes = {};
  
@@ -137,23 +119,18 @@ No explanations. No headings. Just the list.`;
         const text = data.content?.find(b => b.type === 'text')?.text?.trim();
         if (!text) continue;
  
-        // Codes to exclude entirely
-        const excluded = new Set(['DW605', 'FLUPANEL']);
- 
         text.split('\n').forEach(line => {
           line = line.trim();
-          if (!line || line.startsWith('#') || line.startsWith('*') || line.startsWith('Custom_')) return;
+          if (!line) return;
  
           const parts = line.split(/\s+/);
+          if (parts.length < 2) return;
+ 
           const code = parts[0].toUpperCase();
           const val = parseFloat(parts[1]);
  
-          if (!code || isNaN(val)) return;
-          if (excluded.has(code)) return;
-          if (code.startsWith('CUSTOM_')) return;
- 
-          // Validate code format — must contain at least one letter
-          if (!code.match(/^[A-Z][A-Z0-9_-]*$/)) return;
+          // Basic sanity check — must be a plausible code and numeric value
+          if (!code.match(/^[A-Z][A-Z0-9_-]+$/) || isNaN(val) || val <= 0) return;
  
           allCodes[code] = (allCodes[code] || 0) + val;
         });
