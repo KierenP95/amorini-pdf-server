@@ -49,7 +49,6 @@ app.post('/extract', async (req, res) => {
       }
     } catch (splitErr) {
       console.error('PDF split error:', splitErr.message);
-      // Fall back to single chunk — will fail if over 100 pages
       chunks.push(pdfBase64);
     }
  
@@ -57,26 +56,52 @@ app.post('/extract', async (req, res) => {
  
     const prompt = `Extract ALL product codes from this Katana label PDF. Process every single page.
  
-This PDF may contain cabinets, benchtops and doors/panels mixed together.
+Each page has this structure:
+[barcode number]
+[date]
+[qty] pcs or [length] m
+[job ref] - [description]
+[PRODUCT CODE]
+*scan*
  
-For each page output one line: CODE VALUE where:
-- Cabinets (prefix PMW-, OLOA-, PJMW- etc): strip prefix, output CODE QTY e.g. SB100 1
-- Benchtops M2M (prefix BXP-, has metres on label): keep full code, output CODE LENGTH e.g. BXPMIR-WARMGREY60 2.42
-- Benchtops slab (format COLOUR-DIMENSIONS, has pcs): keep full code, output CODE QTY e.g. ALPINE-3050900 2
-- Doors/panels (all other codes): keep full code, output CODE QTY e.g. PMW-BB 4
+Extract the PRODUCT CODE and quantity/length from every page.
  
-EXCLUDE: DW605, TFK, TFK_, UP, F409, FLUPANEL.
-INCLUDE: UBMWHT, UBMWH, UBO60, UBO90.
+Rules by product type:
  
+CABINETS (prefix PMW-, OLOA-, PJMW-, ESC-, EMW-, OCO-, ESO-, ESS-, OAO-, OCW-, OHO-, ONB-, OSPO-, OMW-, SMC-, SMN-, SMS-, PGW-, PSN-, SDA- AND the part after the prefix looks like a cabinet code — letters followed by numbers, e.g. SB100, WBO900, B600):
+- Strip the prefix, output just the cabinet code + qty
+- Example: PMW-SB600 1 → SB600 1
+ 
+DOORS & PANELS (prefix PMW-, PJMW- etc BUT the part after the prefix is NOT a cabinet code — it's an abbreviation like TFK, BEP, SFP, WEP, UP, BB, FP, F409, F40Z, F45D, F454 etc):
+- Keep the FULL code including prefix
+- Example: PMW-TFK 1 → PMW-TFK 1
+- Example: PJMW-F454 1 → PJMW-F454 1
+ 
+BENCHTOPS linear metre (prefix BXP-, has metres on label):
+- Keep full code + length in metres
+- Example: BXPCEN-FIRESTN695 3.405 → BXPCEN-FIRESTN695 3.405
+ 
+BENCHTOPS slab (format COLOUR-DIMENSIONS, has pcs):
+- Keep full code + qty
+- Example: ALPINE-3050900 2 → ALPINE-3050900 2
+ 
+WARDROBE COMPONENTS (prefix T-, SHIRT, codes like SHIRT1050, T-DT60, T-CLEAT41795, T-SHELF1245, T-UPRIGHT1945):
+- Keep full code + qty
+- Example: SHIRT1050 3 → SHIRT1050 3
+ 
+HARDWARE & OTHER (codes like IADJL, KTDRW45-SC, D500, DRILLINPUSHCATCH, BXPLAMVOLCBLK60):
+- Keep full code + qty
+ 
+EXCLUDE entirely: DW605, FLUPANEL, Custom_* codes
+ 
+Output one line per unique code: CODE VALUE
 No explanations. No headings. Just the list.`;
  
-    // Process chunks with delay between them
     const allCodes = {};
  
     for (let i = 0; i < chunks.length; i++) {
       console.log(`Processing chunk ${i + 1}/${chunks.length}`);
  
-      // Wait 65 seconds between chunks to stay under rate limit
       if (i > 0) {
         console.log('Waiting 65s for rate limit...');
         await new Promise(r => setTimeout(r, 65000));
@@ -112,25 +137,25 @@ No explanations. No headings. Just the list.`;
         const text = data.content?.find(b => b.type === 'text')?.text?.trim();
         if (!text) continue;
  
-        // Parse and merge results
-        const excluded = new Set(['DW605', 'TFK', 'TFK_', 'UP', 'F409', 'FLUPANEL']);
+        // Codes to exclude entirely
+        const excluded = new Set(['DW605', 'FLUPANEL']);
+ 
         text.split('\n').forEach(line => {
           line = line.trim();
-          if (!line || line.startsWith('#') || line.startsWith('*')) return;
+          if (!line || line.startsWith('#') || line.startsWith('*') || line.startsWith('Custom_')) return;
+ 
           const parts = line.split(/\s+/);
           const code = parts[0].toUpperCase();
           const val = parseFloat(parts[1]);
-          if (!code || !code.match(/^[A-Z][A-Z0-9_-]+$/) || isNaN(val)) return;
+ 
+          if (!code || isNaN(val)) return;
           if (excluded.has(code)) return;
-          // Strip cabinet finish prefixes (PMW-, OLOA-, PJMW- etc) but keep benchtop/door prefixes
-          let finalCode = code;
-          const cabinetPrefixMatch = code.match(/^(PMW|OLOA|PJMW|ESC|EMW|OCO|ESO|ESS|OAO|OCW|OHO|ONB|OSPO|OMW|SMC|SMN|SMS|PGW|PSN|SDA)-(.+)$/);
-          // Only strip prefix if remaining part looks like a cabinet code (starts with B,W,T,P,S,U)
-          // Keep full code for benchtops (BXP-) and DEK- slabs
-          if (cabinetPrefixMatch && !code.startsWith('BXP') && !code.startsWith('DEK')) {
-            finalCode = cabinetPrefixMatch[2];
-          }
-          allCodes[finalCode] = (allCodes[finalCode] || 0) + val;
+          if (code.startsWith('CUSTOM_')) return;
+ 
+          // Validate code format — must contain at least one letter
+          if (!code.match(/^[A-Z][A-Z0-9_-]*$/)) return;
+ 
+          allCodes[code] = (allCodes[code] || 0) + val;
         });
  
         console.log(`Chunk ${i + 1} processed — ${Object.keys(allCodes).length} unique codes so far`);
