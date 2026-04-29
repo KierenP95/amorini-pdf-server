@@ -14,41 +14,36 @@ app.use(express.json({ limit: '50mb' }));
  
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
  
-// Cabinet finish prefixes — strip these when the suffix looks like a cabinet code
+// Cabinet finish prefixes to strip
 const CABINET_PREFIXES = [
   'PMW', 'PJMW', 'OLOA', 'ESC', 'EMW', 'OCO', 'ESO', 'ESS',
   'OAO', 'OCW', 'OHO', 'ONB', 'OSPO', 'OMW', 'SMC', 'SMN',
   'SMS', 'PGW', 'PSN', 'SDA', 'ND'
 ];
  
-// Cabinet suffix pattern: starts with 1-2 letters then digits (e.g. SB600, W100S, B45D2PT, WVN90)
-// Door suffix pattern: all letters or letters+digits with no leading digit-heavy structure (e.g. TFK, BEP, F409, F45D)
-// Rule: if suffix contains digits AND starts with a letter followed eventually by digits → cabinet
-// If suffix is all letters OR matches known door patterns → door, keep full code
 function processCode(rawCode) {
   const upper = rawCode.toUpperCase();
  
-  // Never strip BXP* (benchtops) or DEK* (dekton slabs)
+  // Never touch benchtop or dekton codes
   if (upper.startsWith('BXP') || upper.startsWith('DEK')) return upper;
  
-  // Check if it matches a cabinet prefix
   const prefixMatch = upper.match(
     new RegExp(`^(${CABINET_PREFIXES.join('|')})-(.+)$`)
   );
  
-  if (!prefixMatch) return upper; // No cabinet prefix — return as-is
+  if (!prefixMatch) return upper;
  
   const suffix = prefixMatch[2];
  
-  // Cabinet suffix: starts with letters, contains digits, e.g. SB600, W100S, B45D2PT, WVN90, P100Z
-  // Must have at least one digit somewhere
+  // Cabinet suffix: starts with 1-4 letters then a digit e.g. SB600, W100S, B45D2PT, WVN90
+  // Door suffix: all letters OR letter+digits but short abbreviation e.g. TFK, BEP, F409, F45D
   const isCabinetSuffix = /^[A-Z]{1,4}\d/.test(suffix);
  
-  if (isCabinetSuffix) {
-    return suffix; // Strip prefix — it's a cabinet
-  } else {
-    return upper; // Keep full code — it's a door/panel
-  }
+  return isCabinetSuffix ? suffix : upper;
+}
+ 
+function isBenchtop(code) {
+  return code.startsWith('BXP') || code.startsWith('DEK');
 }
  
 app.post('/extract', async (req, res) => {
@@ -113,9 +108,13 @@ PMW-TFK 1
 PMW-BEP 3
 PMW-SB600 2
 BXPCEN-FIRESTN695 3.405
+BXPCEN-FIRESTN695 1.79
 SHIRT1050 1`;
  
-    const allCodes = {};
+    // Cabinets/doors: sum duplicates (qty doesn't change by room)
+    // Benchtops: keep EACH line separate (each is a physically different piece)
+    const cabinetCodes = {};
+    const benchtopLines = []; // array, not object — preserves duplicates
  
     for (let i = 0; i < chunks.length; i++) {
       console.log(`Processing chunk ${i + 1}/${chunks.length}`);
@@ -167,26 +166,30 @@ SHIRT1050 1`;
  
           if (isNaN(val) || val <= 0) return;
  
-          // Process code — strips cabinet prefixes, keeps door/benchtop codes intact
           const finalCode = processCode(rawCode);
- 
           if (!finalCode.match(/^[A-Z][A-Z0-9_-]+$/)) return;
  
-          allCodes[finalCode] = (allCodes[finalCode] || 0) + val;
+          if (isBenchtop(finalCode)) {
+            // Keep each benchtop as a separate line
+            benchtopLines.push(`${finalCode} ${val}`);
+          } else {
+            // Sum cabinets and doors
+            cabinetCodes[finalCode] = (cabinetCodes[finalCode] || 0) + val;
+          }
         });
  
-        console.log(`Chunk ${i + 1} processed — ${Object.keys(allCodes).length} unique codes so far`);
+        console.log(`Chunk ${i + 1} processed — ${Object.keys(cabinetCodes).length} cabinet/door codes, ${benchtopLines.length} benchtop lines so far`);
  
       } catch (err) {
         console.error(`Chunk ${i + 1} error:`, err.message);
       }
     }
  
-    const finalText = Object.entries(allCodes)
-      .map(([code, val]) => `${code} ${val}`)
-      .join('\n');
+    // Combine: cabinet/door lines first, then individual benchtop lines
+    const cabinetLines = Object.entries(cabinetCodes).map(([code, val]) => `${code} ${val}`);
+    const finalText = [...cabinetLines, ...benchtopLines].join('\n');
  
-    console.log(`Done — ${Object.keys(allCodes).length} total unique codes`);
+    console.log(`Done — ${cabinetLines.length} cabinet/door codes, ${benchtopLines.length} benchtop lines`);
     res.json({ codes: finalText });
  
   } catch (err) {
