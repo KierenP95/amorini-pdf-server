@@ -14,6 +14,43 @@ app.use(express.json({ limit: '50mb' }));
  
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
  
+// Cabinet finish prefixes — strip these when the suffix looks like a cabinet code
+const CABINET_PREFIXES = [
+  'PMW', 'PJMW', 'OLOA', 'ESC', 'EMW', 'OCO', 'ESO', 'ESS',
+  'OAO', 'OCW', 'OHO', 'ONB', 'OSPO', 'OMW', 'SMC', 'SMN',
+  'SMS', 'PGW', 'PSN', 'SDA', 'ND'
+];
+ 
+// Cabinet suffix pattern: starts with 1-2 letters then digits (e.g. SB600, W100S, B45D2PT, WVN90)
+// Door suffix pattern: all letters or letters+digits with no leading digit-heavy structure (e.g. TFK, BEP, F409, F45D)
+// Rule: if suffix contains digits AND starts with a letter followed eventually by digits → cabinet
+// If suffix is all letters OR matches known door patterns → door, keep full code
+function processCode(rawCode) {
+  const upper = rawCode.toUpperCase();
+ 
+  // Never strip BXP* (benchtops) or DEK* (dekton slabs)
+  if (upper.startsWith('BXP') || upper.startsWith('DEK')) return upper;
+ 
+  // Check if it matches a cabinet prefix
+  const prefixMatch = upper.match(
+    new RegExp(`^(${CABINET_PREFIXES.join('|')})-(.+)$`)
+  );
+ 
+  if (!prefixMatch) return upper; // No cabinet prefix — return as-is
+ 
+  const suffix = prefixMatch[2];
+ 
+  // Cabinet suffix: starts with letters, contains digits, e.g. SB600, W100S, B45D2PT, WVN90, P100Z
+  // Must have at least one digit somewhere
+  const isCabinetSuffix = /^[A-Z]{1,4}\d/.test(suffix);
+ 
+  if (isCabinetSuffix) {
+    return suffix; // Strip prefix — it's a cabinet
+  } else {
+    return upper; // Keep full code — it's a door/panel
+  }
+}
+ 
 app.post('/extract', async (req, res) => {
   try {
     const { pdfBase64 } = req.body;
@@ -74,8 +111,8 @@ Rules:
 Example output:
 PMW-TFK 1
 PMW-BEP 3
+PMW-SB600 2
 BXPCEN-FIRESTN695 3.405
-SB600 2
 SHIRT1050 1`;
  
     const allCodes = {};
@@ -125,12 +162,17 @@ SHIRT1050 1`;
           const parts = line.split(/\s+/);
           if (parts.length < 2) return;
  
-          const code = parts[0].toUpperCase();
+          const rawCode = parts[0];
           const val = parseFloat(parts[1]);
  
-          if (!code.match(/^[A-Z][A-Z0-9_-]+$/) || isNaN(val) || val <= 0) return;
+          if (isNaN(val) || val <= 0) return;
  
-          allCodes[code] = (allCodes[code] || 0) + val;
+          // Process code — strips cabinet prefixes, keeps door/benchtop codes intact
+          const finalCode = processCode(rawCode);
+ 
+          if (!finalCode.match(/^[A-Z][A-Z0-9_-]+$/)) return;
+ 
+          allCodes[finalCode] = (allCodes[finalCode] || 0) + val;
         });
  
         console.log(`Chunk ${i + 1} processed — ${Object.keys(allCodes).length} unique codes so far`);
