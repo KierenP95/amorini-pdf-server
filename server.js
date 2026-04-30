@@ -135,7 +135,7 @@ T-DT60 1`;
  
       if (i > 0) {
         console.log('Waiting 15s for rate limit...');
-        await new Promise(r => setTimeout(r, 15000));
+        await new Promise(r => setTimeout(r, 65000));
       }
  
       try {
