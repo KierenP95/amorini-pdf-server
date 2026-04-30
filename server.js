@@ -47,9 +47,13 @@ function processCode(rawCode) {
  
   const suffix = prefixMatch[2];
  
-  // Cabinet suffix: starts with 1-4 letters then a digit e.g. SB600, W100S, B45D2PT, WVN90
-  // Door suffix: all letters or short abbreviation e.g. TFK, BEP, BB, FP, F409, F45D
-  const isCabinetSuffix = /^[A-Z]{1,4}\d/.test(suffix);
+  // Cabinet suffix detection:
+  // Multi-letter prefixes (2+) before digits are always cabinet: SB600, WVN90, BR45Z, EPT60
+  // Single-letter cabinet prefixes: B, W, P, S, T, V, L (but NOT F, which is always a door code)
+  // Door codes with single letter: F409, F45D, F40Z etc
+  const multiLetterCabinet = /^[A-Z]{2,}\d/.test(suffix);
+  const singleLetterCabinet = /^[BWPSTVLU]\d/.test(suffix);
+  const isCabinetSuffix = multiLetterCabinet || singleLetterCabinet;
  
   return isCabinetSuffix ? suffix : upper;
 }
