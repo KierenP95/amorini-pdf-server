@@ -21,8 +21,20 @@ const CABINET_PREFIXES = [
   'SMS', 'PGW', 'PSN', 'SDA', 'ND'
 ];
  
+// Codes to exclude entirely — hardware/filler items not needed for CBM
+const EXCLUDED_CODES = new Set([
+  'DW605', 'FLUPANEL', 'DRILLINPUSHCATCH', 'IADJL'
+]);
+ 
 function processCode(rawCode) {
-  const upper = rawCode.toUpperCase();
+  // Strip trailing underscores and whitespace
+  const upper = rawCode.toUpperCase().replace(/_+$/, '').trim();
+ 
+  // Skip excluded codes
+  if (EXCLUDED_CODES.has(upper)) return null;
+ 
+  // Skip CUSTOM_* codes
+  if (upper.startsWith('CUSTOM')) return null;
  
   // Never touch benchtop or dekton codes
   if (upper.startsWith('BXP') || upper.startsWith('DEK')) return upper;
@@ -36,7 +48,7 @@ function processCode(rawCode) {
   const suffix = prefixMatch[2];
  
   // Cabinet suffix: starts with 1-4 letters then a digit e.g. SB600, W100S, B45D2PT, WVN90
-  // Door suffix: all letters OR letter+digits but short abbreviation e.g. TFK, BEP, F409, F45D
+  // Door suffix: all letters or short abbreviation e.g. TFK, BEP, BB, FP, F409, F45D
   const isCabinetSuffix = /^[A-Z]{1,4}\d/.test(suffix);
  
   return isCabinetSuffix ? suffix : upper;
@@ -96,7 +108,7 @@ app.post('/extract', async (req, res) => {
 Extract the PRODUCT CODE and its quantity/length from every page.
  
 Rules:
-- Output the product code EXACTLY as printed — do not strip or modify any prefix
+- Output the product code EXACTLY as printed — do not strip, modify, or add any characters
 - If the label shows "pcs", output the integer quantity
 - If the label shows "m", output the decimal length (e.g. 3.405)
 - One line per page: CODE VALUE
@@ -105,23 +117,25 @@ Rules:
  
 Example output:
 PMW-TFK 1
+PMW-BB 2
 PMW-BEP 3
 PMW-SB600 2
+PJMW-HAMPER45 1
 BXPCEN-FIRESTN695 3.405
-BXPCEN-FIRESTN695 1.79
-SHIRT1050 1`;
+SHIRT1050 1
+T-DT60 1`;
  
-    // Cabinets/doors: sum duplicates (qty doesn't change by room)
+    // Cabinets/doors: sum duplicates
     // Benchtops: keep EACH line separate (each is a physically different piece)
     const cabinetCodes = {};
-    const benchtopLines = []; // array, not object — preserves duplicates
+    const benchtopLines = [];
  
     for (let i = 0; i < chunks.length; i++) {
       console.log(`Processing chunk ${i + 1}/${chunks.length}`);
  
       if (i > 0) {
-        console.log('Waiting 65s for rate limit...');
-        await new Promise(r => setTimeout(r, 65000));
+        console.log('Waiting 15s for rate limit...');
+        await new Promise(r => setTimeout(r, 15000));
       }
  
       try {
@@ -167,13 +181,12 @@ SHIRT1050 1`;
           if (isNaN(val) || val <= 0) return;
  
           const finalCode = processCode(rawCode);
+          if (!finalCode) return; // excluded
           if (!finalCode.match(/^[A-Z][A-Z0-9_-]+$/)) return;
  
           if (isBenchtop(finalCode)) {
-            // Keep each benchtop as a separate line
             benchtopLines.push(`${finalCode} ${val}`);
           } else {
-            // Sum cabinets and doors
             cabinetCodes[finalCode] = (cabinetCodes[finalCode] || 0) + val;
           }
         });
@@ -185,7 +198,6 @@ SHIRT1050 1`;
       }
     }
  
-    // Combine: cabinet/door lines first, then individual benchtop lines
     const cabinetLines = Object.entries(cabinetCodes).map(([code, val]) => `${code} ${val}`);
     const finalText = [...cabinetLines, ...benchtopLines].join('\n');
  
