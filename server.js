@@ -14,6 +14,9 @@ app.use(express.json({ limit: '50mb' }));
  
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
  
+// Simple request queue to prevent concurrent Claude API calls
+let requestQueue = Promise.resolve();
+ 
 // Cabinet finish prefixes to strip
 const CABINET_PREFIXES = [
   'PMW', 'PJMW', 'OLOA', 'ESC', 'EMW', 'OCO', 'ESO', 'ESS',
@@ -27,16 +30,9 @@ const EXCLUDED_CODES = new Set([
 ]);
  
 function processCode(rawCode) {
-  // Strip trailing underscores and whitespace
   const upper = rawCode.toUpperCase().replace(/_+$/, '').trim();
- 
-  // Skip excluded codes
   if (EXCLUDED_CODES.has(upper)) return null;
- 
-  // Skip CUSTOM_* codes
   if (upper.startsWith('CUSTOM')) return null;
- 
-  // Never touch benchtop or dekton codes
   if (upper.startsWith('BXP') || upper.startsWith('DEK')) return upper;
  
   const prefixMatch = upper.match(
@@ -46,11 +42,6 @@ function processCode(rawCode) {
   if (!prefixMatch) return upper;
  
   const suffix = prefixMatch[2];
- 
-  // Cabinet suffix detection:
-  // Multi-letter prefixes (2+) before digits are always cabinet: SB600, WVN90, BR45Z, EPT60
-  // Single-letter cabinet prefixes: B, W, P, S, T, V, L (but NOT F, which is always a door code)
-  // Door codes with single letter: F409, F45D, F40Z etc
   const multiLetterCabinet = /^[A-Z]{2,}\d/.test(suffix);
   const singleLetterCabinet = /^[BWPSTVLU]\d/.test(suffix);
   const isCabinetSuffix = multiLetterCabinet || singleLetterCabinet;
@@ -62,7 +53,61 @@ function isBenchtop(code) {
   return code.startsWith('BXP') || code.startsWith('DEK');
 }
  
-app.post('/extract', async (req, res) => {
+async function callClaude(chunkBase64, prompt, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': process.env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01'
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-5',
+          max_tokens: 4000,
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: chunkBase64 } },
+              { type: 'text', text: prompt }
+            ]
+          }]
+        })
+      });
+ 
+      const data = await response.json();
+ 
+      if (data.error) {
+        const isRateLimit = data.error.type === 'rate_limit_error' || response.status === 429;
+        console.error(`Claude error (attempt ${attempt}):`, data.error.message || data.error);
+        if (isRateLimit && attempt < retries) {
+          const wait = attempt * 20000;
+          console.log(`Rate limited — waiting ${wait / 1000}s before retry...`);
+          await new Promise(r => setTimeout(r, wait));
+          continue;
+        }
+        return null;
+      }
+ 
+      return data.content?.find(b => b.type === 'text')?.text?.trim() || null;
+ 
+    } catch (err) {
+      console.error(`Claude fetch error (attempt ${attempt}):`, err.message);
+      if (attempt < retries) {
+        await new Promise(r => setTimeout(r, attempt * 5000));
+      }
+    }
+  }
+  return null;
+}
+ 
+app.post('/extract', (req, res) => {
+  // Queue requests so they run sequentially — prevents concurrent Claude API calls
+  requestQueue = requestQueue.then(() => handleExtract(req, res));
+});
+ 
+async function handleExtract(req, res) {
   try {
     const { pdfBase64 } = req.body;
  
@@ -129,8 +174,6 @@ BXPCEN-FIRESTN695 3.405
 SHIRT1050 1
 T-DT60 1`;
  
-    // Cabinets/doors: sum duplicates
-    // Benchtops: keep EACH line separate (each is a physically different piece)
     const cabinetCodes = {};
     const benchtopLines = [];
  
@@ -138,68 +181,40 @@ T-DT60 1`;
       console.log(`Processing chunk ${i + 1}/${chunks.length}`);
  
       if (i > 0) {
-        console.log('Waiting 15s for rate limit...');
-        await new Promise(r => setTimeout(r, 65000));
+        console.log('Waiting 30s between chunks for rate limit...');
+        await new Promise(r => setTimeout(r, 30000));
       }
  
-      try {
-        const response = await fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': process.env.ANTHROPIC_API_KEY,
-            'anthropic-version': '2023-06-01'
-          },
-          body: JSON.stringify({
-            model: 'claude-sonnet-4-5',
-            max_tokens: 4000,
-            messages: [{
-              role: 'user',
-              content: [
-                { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: chunks[i] } },
-                { type: 'text', text: prompt }
-              ]
-            }]
-          })
-        });
+      const text = await callClaude(chunks[i], prompt);
+      if (!text) {
+        console.log(`Chunk ${i + 1} returned no text`);
+        continue;
+      }
  
-        const data = await response.json();
-        if (data.error) {
-          console.error('Claude error:', data.error);
-          continue;
+      text.split('\n').forEach(line => {
+        line = line.trim();
+        if (!line) return;
+ 
+        const parts = line.split(/\s+/);
+        if (parts.length < 2) return;
+ 
+        const rawCode = parts[0];
+        const val = parseFloat(parts[1]);
+ 
+        if (isNaN(val) || val <= 0) return;
+ 
+        const finalCode = processCode(rawCode);
+        if (!finalCode) return;
+        if (!finalCode.match(/^[A-Z][A-Z0-9_-]+$/)) return;
+ 
+        if (isBenchtop(finalCode)) {
+          benchtopLines.push(`${finalCode} ${val}`);
+        } else {
+          cabinetCodes[finalCode] = (cabinetCodes[finalCode] || 0) + val;
         }
+      });
  
-        const text = data.content?.find(b => b.type === 'text')?.text?.trim();
-        if (!text) continue;
- 
-        text.split('\n').forEach(line => {
-          line = line.trim();
-          if (!line) return;
- 
-          const parts = line.split(/\s+/);
-          if (parts.length < 2) return;
- 
-          const rawCode = parts[0];
-          const val = parseFloat(parts[1]);
- 
-          if (isNaN(val) || val <= 0) return;
- 
-          const finalCode = processCode(rawCode);
-          if (!finalCode) return; // excluded
-          if (!finalCode.match(/^[A-Z][A-Z0-9_-]+$/)) return;
- 
-          if (isBenchtop(finalCode)) {
-            benchtopLines.push(`${finalCode} ${val}`);
-          } else {
-            cabinetCodes[finalCode] = (cabinetCodes[finalCode] || 0) + val;
-          }
-        });
- 
-        console.log(`Chunk ${i + 1} processed — ${Object.keys(cabinetCodes).length} cabinet/door codes, ${benchtopLines.length} benchtop lines so far`);
- 
-      } catch (err) {
-        console.error(`Chunk ${i + 1} error:`, err.message);
-      }
+      console.log(`Chunk ${i + 1} done — ${Object.keys(cabinetCodes).length} cabinet/door codes, ${benchtopLines.length} benchtop lines so far`);
     }
  
     const cabinetLines = Object.entries(cabinetCodes).map(([code, val]) => `${code} ${val}`);
@@ -212,6 +227,6 @@ T-DT60 1`;
     console.error('Server error:', err);
     res.status(500).json({ error: err.message });
   }
-});
+}
  
 app.listen(PORT, () => console.log(`Amorini PDF server running on port ${PORT}`));
